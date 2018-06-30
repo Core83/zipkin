@@ -165,7 +165,235 @@ class TreeBuilder {
   }
 }
 
+class ClockSkew {
+  constructor(params) {
+    const {endpoint, skew} = params;
+    this._endpoint = endpoint;
+    this._skew = skew;
+  }
+
+  get endpoint() {
+    return this._endpoint;
+  }
+
+  get skew() {
+    return this._skew;
+  }
+}
+
+function ipsMatch(a, b) {
+  if (a.ipv6 && b.ipv6 && a.ipv6 === b.ipv6) {
+    return true;
+  }
+  if (!a.ipv4 && !b.ipv4) return false;
+  return a.ipv4 === b.ipv4;
+}
+
+// If any annotation has an IP with skew associated, adjust accordingly.
+function adjustTimestamps(span, skew) {
+  const spanTimestamp = span.timestamp;
+
+  let annotations;
+  let annotationTimestamp;
+  for (let i = 0; i < span.annotations.length; i++) {
+    const a = span.annotations[i];
+    if (!a.endpoint) continue;
+    if (ipsMatch(skew.endpoint, a.endpoint)) {
+      if (!annotations) annotations = span.annotations.slice(0);
+      if (spanTimestamp && a.timestamp === spanTimestamp) {
+        annotationTimestamp = a.timestamp;
+      }
+      annotations[i] = {timestamp: a.timestamp - skew.skew, value: a.value, endpoint: a.endpoint};
+    }
+  }
+  if (annotations) {
+    if (annotationTimestamp) {
+      span.timestamp = annotationTimestamp - skew.skew; // eslint-disable-line no-param-reassign
+    }
+    span.annotations = annotations; // eslint-disable-line no-param-reassign
+    return span;
+  }
+  // Search for a local span on the skewed endpoint
+  if (!spanTimestamp) return span; // We can't adjust something lacking a timestamp
+  for (let i = 0; i < span.binaryAnnotations.length; i++) {
+    const b = span.binaryAnnotations[i];
+    if (!b.endpoint) continue;
+    if (b.key === 'lc' && ipsMatch(skew.endpoint, b.endpoint)) {
+      span.timestamp = spanTimestamp - skew.skew; // eslint-disable-line no-param-reassign
+      return span;
+    }
+  }
+  return span;
+}
+
+// Uses client/server annotations to determine if there's clock skew.
+function getClockSkew(span) {
+  let clientSend;
+  let serverRecv;
+  let serverSend;
+  let clientRecv;
+
+  (span.annotations || []).forEach((a) => {
+    switch (a.value) {
+      case 'cs':
+        clientSend = a;
+        break;
+      case 'sr':
+        serverRecv = a;
+        break;
+      case 'ss':
+        serverSend = a;
+        break;
+      case 'cr':
+        clientRecv = a;
+        break;
+      default:
+    }
+  });
+
+  let oneWay = false;
+  if (!clientSend || !serverRecv) {
+    return undefined;
+  } else if (!serverSend || !clientRecv) {
+    oneWay = true;
+  }
+
+  let server = serverRecv.endpoint;
+  if (!server && oneWay) server = serverSend.endpoint;
+  if (!server) return undefined;
+
+  let client = clientSend.endpoint;
+  if (!client && oneWay) client = clientRecv.endpoint;
+  if (!client) return undefined;
+
+  // There's no skew if the RPC is going to itself
+  if (ipsMatch(server, client)) return undefined;
+
+  let latency;
+  if (oneWay) {
+    latency = serverRecv.timestamp - clientSend.timestamp;
+    // the only way there is skew is when the client appears to be after the server
+    if (latency > 0) return undefined;
+    // We can't currently do better than push the client and server apart by minimum duration (1)
+    return new ClockSkew({endpoint: server, skew: latency - 1});
+  } else {
+    const clientDuration = clientRecv.timestamp - clientSend.timestamp;
+    const serverDuration = serverSend.timestamp - serverRecv.timestamp;
+    // We assume latency is half the difference between the client and server duration.
+    // This breaks if client duration is smaller than server (due to async return for example).
+    if (clientDuration < serverDuration) return undefined;
+
+    latency = (clientDuration - serverDuration) / 2;
+    // We can't see skew when send happens before receive
+    if (latency < 0) return undefined;
+
+    const skew = serverRecv.timestamp - latency - clientSend.timestamp;
+    if (skew !== 0) {
+      return new ClockSkew({endpoint: server, skew});
+    }
+  }
+
+  return undefined;
+}
+
+function isSingleHostSpan(span) {
+  // using normal for loop as it allows us to return out of the function
+  let endpoint;
+  for (let i = 0; i < span.annotations.length; i++) {
+    const annotation = span.annotations[i];
+    if (!endpoint) {
+      endpoint = annotation.endpoint;
+      continue;
+    }
+    if (!ipsMatch(endpoint, annotation.endpoint)) {
+      return false; // there's a mix of endpoints in this span
+    }
+  }
+  for (let i = 0; span.binaryAnnotations.length; i++) {
+    const binaryAnnotation = span.binaryAnnotations[i];
+    if (binaryAnnotation.type || binaryAnnotation.value === true) continue;
+    if (!endpoint) {
+      endpoint = binaryAnnotation.endpoint;
+      continue;
+    }
+    if (!ipsMatch(endpoint, binaryAnnotation.endpoint)) {
+      return false; // there's a mix of endpoints in this span
+    }
+  }
+  return true;
+}
+
+/*
+ * Recursively adjust the timestamps on the span tree. Root span is the reference point, all
+ * children's timestamps gets adjusted based on that span's timestamps.
+ */
+function adjust(node, skewFromParent) {
+  // adjust skew for the endpoint brought over from the parent span
+  if (skewFromParent) {
+    node.setValue(adjustTimestamps(node.value, skewFromParent));
+  }
+
+  // Is there any skew in the current span?
+  let skew = getClockSkew(node.value);
+  if (skew) {
+    // the current span's skew may be a different endpoint than its parent, so adjust again.
+    node.setValue(adjustTimestamps(node.value, skew));
+  } else if (skewFromParent && isSingleHostSpan(node.value)) {
+    // Assumes we are on the same host: propagate skew from our parent
+    skew = skewFromParent;
+  }
+  // propagate skew to any children
+  node.children.forEach(child => adjust(child, skew));
+}
+
+function correctForClockSkew(spans, debug = true) {
+  if (spans.length === 0) return spans;
+
+  const traceId = spans[0].traceId;
+  let rootSpanId;
+  const treeBuilder = new TreeBuilder({traceId, debug});
+
+  let dataError = false;
+  spans.forEach(next => {
+    if (!next.parentId) {
+      if (rootSpanId) {
+        if (debug) {
+          const prefix = 'skipping redundant root span';
+          /* eslint-disable no-console */
+          console.log(
+            `${prefix}: traceId=${traceId}, rootSpanId=${rootSpanId}, spanId=${next.id}`
+          );
+        }
+        dataError = true;
+        return;
+      }
+      rootSpanId = next.id;
+    }
+    if (!treeBuilder.addNode(next.parentId, next.id, next)) {
+      dataError = true;
+    }
+  });
+
+  if (!rootSpanId) {
+    if (debug) {
+      console.log(`skipping clock skew adjustment due to missing root span: traceId=${traceId}`);
+    }
+    return spans;
+  } else if (dataError) {
+    if (debug) {
+      console.log(`skipping clock skew adjustment due to data errors: traceId=${traceId}`);
+    }
+    return spans;
+  }
+
+  const tree = treeBuilder.build();
+  adjust(tree);
+  return tree.traverse();
+}
+
+
 module.exports = {
   Node,
-  TreeBuilder
+  TreeBuilder,
+  correctForClockSkew
 };

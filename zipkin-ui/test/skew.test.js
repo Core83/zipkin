@@ -1,4 +1,4 @@
-const {Node, TreeBuilder} = require('../js/skew');
+const {Node, TreeBuilder, correctForClockSkew} = require('../js/skew');
 const should = require('chai').should();
 
 // originally zipkin2.internal.NodeTest.java
@@ -146,5 +146,43 @@ describe('TreeBuilder', () => {
     const treeBuilder = new TreeBuilder({traceId: 'a'});
     expect(treeBuilder.addNode('b', 'b', {traceId: 'a', parentId: 'b', id: 'b'}))
       .to.equal(false);
+  });
+});
+
+describe('correctForClockSkew', () => {
+  // endpoints from zipkin2.TestObjects
+  const frontend = {
+    serviceName: 'frontend',
+    ipv4: '127.0.0.1',
+    port: 8080
+  };
+
+  const backend = {
+    serviceName: 'backend',
+    ipv4: '192.168.99.101',
+    port: 9000
+  };
+
+  // Sets the server to 1us past the client
+  it('should correct a one-way RPC span', () => {
+    const trace = [
+      {
+        traceId: '1',
+        id: '1',
+        name: '',
+        annotations: [
+          {timestamp: 20, value: 'cs', endpoint: frontend},
+          {timestamp: 10 /* skew */, value: 'sr', endpoint: backend}
+        ]
+      }
+    ];
+
+    const adjusted = correctForClockSkew(trace);
+
+    expect(adjusted.length).to.equal(1);
+    expect(adjusted[0].annotations).to.deep.equal([
+      {timestamp: 20, value: 'cs', endpoint: frontend},
+      {timestamp: 21 /* pushed 1us later */, value: 'sr', endpoint: backend}
+    ]);
   });
 });
