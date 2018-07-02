@@ -195,7 +195,8 @@ function adjustTimestamps(span, skew) {
 
   let annotations;
   let annotationTimestamp;
-  for (let i = 0; i < span.annotations.length; i++) {
+  const annotationLength = span.annotations ? span.annotations.length : 0;
+  for (let i = 0; i < annotationLength; i++) {
     const a = span.annotations[i];
     if (!a.endpoint) continue;
     if (ipsMatch(skew.endpoint, a.endpoint)) {
@@ -207,23 +208,34 @@ function adjustTimestamps(span, skew) {
     }
   }
   if (annotations) {
+    const result = Object.assign({}, span);
     if (annotationTimestamp) {
-      span.timestamp = annotationTimestamp - skew.skew; // eslint-disable-line no-param-reassign
+      result.timestamp = annotationTimestamp - skew.skew;
     }
-    span.annotations = annotations; // eslint-disable-line no-param-reassign
-    return span;
+    result.annotations = annotations;
+    return result;
   }
   // Search for a local span on the skewed endpoint
   if (!spanTimestamp) return span; // We can't adjust something lacking a timestamp
-  for (let i = 0; i < span.binaryAnnotations.length; i++) {
-    const b = span.binaryAnnotations[i];
+  const binaryAnnotations = span.binaryAnnotations || [];
+  for (let i = 0; i < binaryAnnotations.length; i++) {
+    const b = binaryAnnotations[i];
     if (!b.endpoint) continue;
     if (b.key === 'lc' && ipsMatch(skew.endpoint, b.endpoint)) {
-      span.timestamp = spanTimestamp - skew.skew; // eslint-disable-line no-param-reassign
-      return span;
+      const result = Object.assign({}, span);
+      result.timestamp = spanTimestamp - skew.skew;
+      return result;
     }
   }
   return span;
+}
+
+function oneWaySkew(serverRecv, clientSend) {
+  const latency = serverRecv.timestamp - clientSend.timestamp;
+  // the only way there is skew is when the client appears to be after the server
+  if (latency > 0) return undefined;
+  // We can't currently do better than push the client and server apart by minimum duration (1)
+  return new ClockSkew({endpoint: serverRecv.endpoint, skew: latency - 1});
 }
 
 // Uses client/server annotations to determine if there's clock skew.
@@ -271,17 +283,15 @@ function getClockSkew(span) {
 
   let latency;
   if (oneWay) {
-    latency = serverRecv.timestamp - clientSend.timestamp;
-    // the only way there is skew is when the client appears to be after the server
-    if (latency > 0) return undefined;
-    // We can't currently do better than push the client and server apart by minimum duration (1)
-    return new ClockSkew({endpoint: server, skew: latency - 1});
+    return oneWaySkew(serverRecv, clientSend);
   } else {
     const clientDuration = clientRecv.timestamp - clientSend.timestamp;
     const serverDuration = serverSend.timestamp - serverRecv.timestamp;
     // We assume latency is half the difference between the client and server duration.
     // This breaks if client duration is smaller than server (due to async return for example).
-    if (clientDuration < serverDuration) return undefined;
+    if (clientDuration < serverDuration) {
+      return oneWaySkew(serverRecv, clientSend);
+    }
 
     latency = (clientDuration - serverDuration) / 2;
     // We can't see skew when send happens before receive
@@ -297,10 +307,13 @@ function getClockSkew(span) {
 }
 
 function isSingleHostSpan(span) {
+  const annotations = span.annotations || [];
+  const binaryAnnotations = span.binaryAnnotations || [];
+
   // using normal for loop as it allows us to return out of the function
   let endpoint;
-  for (let i = 0; i < span.annotations.length; i++) {
-    const annotation = span.annotations[i];
+  for (let i = 0; i < annotations.length; i++) {
+    const annotation = annotations[i];
     if (!endpoint) {
       endpoint = annotation.endpoint;
       continue;
@@ -309,8 +322,8 @@ function isSingleHostSpan(span) {
       return false; // there's a mix of endpoints in this span
     }
   }
-  for (let i = 0; span.binaryAnnotations.length; i++) {
-    const binaryAnnotation = span.binaryAnnotations[i];
+  for (let i = 0; i < binaryAnnotations.length; i++) {
+    const binaryAnnotation = binaryAnnotations[i];
     if (binaryAnnotation.type || binaryAnnotation.value === true) continue;
     if (!endpoint) {
       endpoint = binaryAnnotation.endpoint;
@@ -395,5 +408,8 @@ function correctForClockSkew(spans, debug = true) {
 module.exports = {
   Node,
   TreeBuilder,
+  ipsMatch, // for testing
+  isSingleHostSpan, // for testing
+  getClockSkew, // for testing
   correctForClockSkew
 };
